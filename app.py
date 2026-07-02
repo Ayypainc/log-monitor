@@ -2,7 +2,7 @@ import os
 import sys
 from datetime import datetime
 from collections import deque
-from flask import Flask, request, jsonify, make_response, send_file, session
+from flask import Flask, request, jsonify, make_response, send_file
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -34,14 +34,7 @@ for alias, path in monitored_dirs.items():
 print("=" * 60)
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "log-monitor-dev-secret")
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 CORS(app)
-
-
-def is_authenticated():
-    return session.get("authenticated") is True
 
 @app.route("/")
 def index():
@@ -541,13 +534,18 @@ def index():
     </div>
 
     <script>
+        let savedPasscode = localStorage.getItem("admin_logs_passcode") || "";
         let activeFolder = "";
         let activeFile = "";
         let autoRefreshInterval = null;
         let originalLogLines = [];
 
         window.onload = function() {
-            loadFolderList();
+            if (!savedPasscode) {
+                showModal();
+            } else {
+                loadFolderList();
+            }
         };
 
         function showModal() {
@@ -558,50 +556,31 @@ def index():
         function savePasscode() {
             const val = document.getElementById("passcodeInput").value.trim();
             if (val) {
-                fetch("/api/auth", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    credentials: "same-origin",
-                    body: JSON.stringify({ passcode: val })
-                })
-                    .then(res => {
-                        if (!res.ok) {
-                            return res.json().then(data => { throw new Error(data.error || "Error") });
-                        }
-                        return res.json();
-                    })
-                    .then(() => {
-                        document.getElementById("passcodeModal").classList.add("hidden");
-                        document.getElementById("authError").classList.add("hidden");
-                        document.getElementById("passcodeInput").value = "";
-                        loadFolderList();
-                    })
-                    .catch(err => {
-                        document.getElementById("authError").classList.remove("hidden");
-                        document.getElementById("authError").innerText = err.message || "Invalid Passcode";
-                    });
+                savedPasscode = val;
+                localStorage.setItem("admin_logs_passcode", val);
+                document.getElementById("passcodeModal").classList.add("hidden");
+                document.getElementById("authError").classList.add("hidden");
+                document.getElementById("passcodeInput").value = "";
+                loadFolderList();
             }
         }
 
         function logout() {
-            fetch("/api/logout", {
-                method: "POST",
-                credentials: "same-origin"
-            }).finally(() => {
-                activeFolder = "";
-                activeFile = "";
-                if (autoRefreshInterval) clearInterval(autoRefreshInterval);
-                document.getElementById("autoRefreshToggle").checked = false;
-                document.getElementById("folderSelect").innerHTML = "";
-                document.getElementById("fileList").innerHTML = "";
-                document.getElementById("consoleOutput").innerText = "Select a log folder and file to begin...";
-                document.getElementById("downloadBtn").disabled = true;
-                document.getElementById("searchInput").value = "";
-                document.getElementById("lineLimit").value = "500";
-                document.getElementById("passcodeInput").value = "";
-                document.getElementById("authError").classList.add("hidden");
-                showModal();
-            });
+            localStorage.removeItem("admin_logs_passcode");
+            savedPasscode = "";
+            activeFolder = "";
+            activeFile = "";
+            if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+            document.getElementById("autoRefreshToggle").checked = false;
+            document.getElementById("folderSelect").innerHTML = "";
+            document.getElementById("fileList").innerHTML = "";
+            document.getElementById("consoleOutput").innerText = "Select a log folder and file to begin...";
+            document.getElementById("downloadBtn").disabled = true;
+            document.getElementById("searchInput").value = "";
+            document.getElementById("lineLimit").value = "500";
+            document.getElementById("passcodeInput").value = "";
+            document.getElementById("authError").classList.add("hidden");
+            showModal();
         }
 
         function togglePasscodeVisibility() {
@@ -621,7 +600,7 @@ def index():
         }
 
         function loadFolderList() {
-            fetch("/api/folders", { credentials: "same-origin" })
+            fetch(`/api/folders?passcode=${encodeURIComponent(savedPasscode)}`)
                 .then(res => {
                     if (!res.ok) {
                         if (res.status === 401) throw new Error("401");
@@ -670,7 +649,7 @@ def index():
         function loadFileList() {
             if (!activeFolder) return;
             
-            fetch(`/api/logs?folder=${encodeURIComponent(activeFolder)}`, { credentials: "same-origin" })
+            fetch(`/api/logs?passcode=${encodeURIComponent(savedPasscode)}&folder=${encodeURIComponent(activeFolder)}`)
                 .then(res => {
                     if (!res.ok) {
                         if (res.status === 401) throw new Error("401");
@@ -799,12 +778,12 @@ def index():
             if (!activeFolder || !activeFile) return;
             
             const lineLimit = document.getElementById("lineLimit").value;
-            let url = `/api/logs?folder=${encodeURIComponent(activeFolder)}&file=${encodeURIComponent(activeFile)}`;
+            let url = `/api/logs?passcode=${encodeURIComponent(savedPasscode)}&folder=${encodeURIComponent(activeFolder)}&file=${encodeURIComponent(activeFile)}`;
             if (lineLimit) {
                 url += `&lines=${lineLimit}`;
             }
             
-            fetch(url, { credentials: "same-origin" })
+            fetch(url)
                 .then(res => {
                     if (!res.ok) {
                         if (res.status === 401) throw new Error("401");
@@ -893,7 +872,7 @@ def index():
 
         function downloadActiveLog() {
             if (!activeFolder || !activeFile) return;
-            window.open(`/api/logs?folder=${encodeURIComponent(activeFolder)}&file=${encodeURIComponent(activeFile)}&download=true`, '_blank');
+            window.open(`/api/logs?passcode=${encodeURIComponent(savedPasscode)}&folder=${encodeURIComponent(activeFolder)}&file=${encodeURIComponent(activeFile)}&download=true`, '_blank');
         }
         
         document.getElementById("passcodeInput").addEventListener("keyup", function(event) {
@@ -913,39 +892,19 @@ def get_folders():
     """
     Returns lists of monitored folder aliases.
     """
-    if not is_authenticated():
+    passcode = request.args.get("passcode")
+    if not passcode or passcode != ADMIN_LOGS_PASSCODE:
         return make_response(jsonify({"error": "Unauthorized"}), 401)
     return jsonify(list(monitored_dirs.keys()))
 
-
-@app.route("/api/auth", methods=["POST"])
-def authenticate():
-    """
-    Validates the passcode and creates a browser session.
-    """
-    data = request.get_json(silent=True) or {}
-    passcode = (data.get("passcode") or "").strip()
-    if not passcode or passcode != ADMIN_LOGS_PASSCODE:
-        return make_response(jsonify({"error": "Invalid Passcode"}), 401)
-
-    session["authenticated"] = True
-    return jsonify({"ok": True})
-
-
-@app.route("/api/logout", methods=["POST"])
-def clear_authentication():
-    """
-    Clears the browser session.
-    """
-    session.clear()
-    return jsonify({"ok": True})
 
 @app.route("/api/logs")
 def get_logs():
     """
     Protected endpoint to list, view, or download logs.
     """
-    if not is_authenticated():
+    passcode = request.args.get("passcode")
+    if not passcode or passcode != ADMIN_LOGS_PASSCODE:
         return make_response(jsonify({"error": "Unauthorized"}), 401)
 
     # 1. Get folder path
